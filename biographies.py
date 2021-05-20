@@ -1,3 +1,5 @@
+import aiohttp
+import asyncio
 from bs4 import BeautifulSoup
 from collections import namedtuple
 import pywikiapi
@@ -9,8 +11,8 @@ from pprint import pprint
 
 # Regexps
 
-regexp_birth = re.compile(r"^([-\d\.]+)\s*\/.*?Naissance.+$")
-regexp_death = re.compile(r"^([-\d\.]*\d+).+Décès.+$")
+regexp_birth = re.compile(r"^(\d+)[-\d\.]*\s*\/.*?Naissance.+$")
+regexp_death = re.compile(r"^(\d+)[-\d\.]*\s*\/.*?Décès.+$")
 
 regexp_election = re.compile(r"^.*[EÉ]lection.*?(?:en tant que|comme|au poste de) ([\w '-]+).*$")
 regexp_nomination = re.compile(r"^.*Nomination.*?(?:comme|au titre de) ?((?:(?! par)[\w '-])+).*$")
@@ -30,9 +32,20 @@ def regexp_match(regexp, text):
 site_wikipast = pywikiapi.Site("http://wikipast.epfl.ch/wikipast/api.php")
 site_wikipast.no_ssl = True
 
-def get_page(title):
-  data = site_wikipast('parse', page=title)['parse']
-  return BeautifulSoup(data['text'], "html.parser")
+async def get_page(title, *, session):
+  async with session.get(f"http://wikipast.epfl.ch/wikipast/api.php?action=parse&page={title}&format=json&formatversion=2") as resp:
+    if resp.status == 500:
+      # print(await resp.text())
+      print(f"Warning: Server returned HTTP 500 for '{title}'", file=sys.stderr)
+      return None
+
+    data = await resp.json()
+
+    if 'error' in data:
+      print(f"Warning: Request error for '{title}'", file=sys.stderr)
+      return None
+
+    return BeautifulSoup(data['parse']['text'], "html.parser")
 
 def edit_page(title, text):
   site_wikipast('edit', title=title, text=text, token=site_wikipast.token())
@@ -40,17 +53,18 @@ def edit_page(title, text):
 
 # Wikidata
 
-site_wikidata = pywikiapi.Site("https://www.wikidata.org/w/api.php")
+async def get_wikidata_description(wikidata_id, *, session):
+  async with session.get(f"https://www.wikidata.org/w/api.php?action=wbgetentities&ids={wikidata_id}&format=json&formatversion=2") as resp:
+    data = await resp.json()
+    entity = data['entities'].get(wikidata_id)
 
-def get_wikidata_description(wikidata_id):
-  data = site_wikidata('wbgetentities', ids=wikidata_id)
-  entity = data['entities'].get(wikidata_id)
+    if entity:
+      descriptions = entity.get('descriptions')
+      if not descriptions: return None
 
-  if entity:
-    descriptions = entity['descriptions']
-    desc = descriptions.get('fr') or descriptions.get('en')
+      desc = descriptions.get('fr') or descriptions.get('en')
 
-    if desc: return desc['value']
+      if desc: return desc['value']
 
   return None
 
@@ -58,8 +72,12 @@ def get_wikidata_description(wikidata_id):
 
 Person = namedtuple("Person", ["birth", "death", "job", "name"])
 
-def find_page(name):
-  page = get_page(name)
+async def find_page(name, *, session, wikidata_cache):
+  page = await get_page(name, session=session)
+
+  if not page:
+    return None
+
   birth = None
   death = None
   jobs = list()
@@ -93,14 +111,17 @@ def find_page(name):
       wikidata_id = regexp_match(regexp_wikidata, text)
 
   if wikidata_id:
-    description = get_wikidata_description(wikidata_id)
+    if not wikidata_id in wikidata_cache:
+      wikidata_cache[wikidata_id] = await get_wikidata_description(wikidata_id, session=session)
 
+    description = wikidata_cache[wikidata_id]
     if description: jobs.append(description)
 
   if birth or death or jobs:
     return Person(birth=birth, death=death, job=jobs[-1] if jobs else None, name=name)
 
   # Return None is there is no sign that the page represents a person.
+  return None
 
 
 # Storage
@@ -121,17 +142,31 @@ def load_list(filename):
 import json
 import numpy as np
 
-homonyms_names = np.load("name_homonomys.npy", allow_pickle=True)[0:100]
-homonyms_list = list()
+homonyms_names = np.load("name_homonomys.npy", allow_pickle=True)[0:1000]
 
-for index, homonyms in enumerate(homonyms_names):
-  people = [page for page in [find_page(name) for name in homonyms] if page is not None]
+async def create_list():
+  session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=200))
+  homonyms_list = list()
+  done = 0
 
-  if len(people) > 1:
-    homonyms_list.append(Homonyms(name="Someone", people=people))
+  async def process_homonyms(index):
+    nonlocal done
 
-  print(f"\r{index + 1}/{len(homonyms_names)}", end="", file=sys.stderr)
-  # pprint(people)
+    homonyms = homonyms_names[index]
+    wikidata_cache = dict()
+    people = [page for page in await asyncio.gather(*[find_page(name, session=session, wikidata_cache=wikidata_cache) for name in homonyms]) if page is not None]
+
+    if len(people) > 1:
+      homonyms_list.append(Homonyms(name="Someone", people=people))
+
+    done += 1
+    print(f"\r{done}/{len(homonyms_names)}", end="", file=sys.stderr)
+    # pprint(people)
+
+  await asyncio.gather(*[process_homonyms(index) for index in range(len(homonyms_names))])
+  await session.close()
+
+  return homonyms_list
 
 
 # save_list(homonyms_list, "0-1000.json")
@@ -157,5 +192,15 @@ def format_homonyms(homonyms):
 
   return output
 
-for homonyms in homonyms_list:
-  print(format_homonyms(homonyms))
+
+# Main
+
+async def main():
+  homonyms_list = await create_list()
+
+  for homonyms in homonyms_list:
+    print(format_homonyms(homonyms))
+
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())
