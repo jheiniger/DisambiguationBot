@@ -9,7 +9,7 @@ import sys
 import reader
 
 
-# Regexps
+# Regexps biographies
 
 regexp_birth = re.compile(r"^\*\s*(\d+)[-\d\.]*\s*\/.*?Naissance.+$", re.MULTILINE)
 regexp_death = re.compile(r"^\*\s*(\d+)[-\d\.]*\s*\/.*?Décès.+$", re.MULTILINE)
@@ -18,6 +18,12 @@ regexp_election = re.compile(r"^\*.*[EÉ]lection.*?(?:en tant que|comme|au poste
 regexp_nomination = re.compile(r"^\*.*Nomination.*?(?:comme|au titre de) ?((?:(?! par)[\w '-])+).*$", re.MULTILINE)
 
 regexp_wikidata = re.compile(r"^Wikidata: (Q\d+).*$", re.MULTILINE)
+
+# Regexps bottin
+
+regexp_BotBottin2_3_4 = re.compile(r"^\*.*Mention de.*?(?:dans la catégorie|avec la catégorie) ([\w '-]+).*$", re.MULTILINE)
+regexp_BotBottin5 = re.compile(r"^\*.* est mentionné dans la catégorie ([\w '-]+).*$", re.MULTILINE)
+regexp_BotBottin6 = re.compile(r"^\*.*([\w '-]+), exerce son activité au .*$", re.MULTILINE)
 
 # Utility for getting matching groups directly.
 def regexp_match(regexp, text):
@@ -85,6 +91,23 @@ async def find_page(name, *, session, wikidata_cache):
 
   if birth or death or jobs:
     return Person(birth=birth, death=death, job=jobs[-1] if jobs else None, name=name)
+  
+  # Bottin part
+  
+  job_BotBottin2_3_4 = regexp_match(regexp_BotBottin2_3_4, text)  
+
+  if job_BotBottin2_3_4:
+    return Person(birth=None, death=None, job=job_BotBottin2_3_4, name=name)
+
+  job_BotBottin5 = regexp_match(regexp_BotBottin5, text)
+    
+  if job_BotBottin5:
+    return Person(birth=None, death=None, job=job_BotBottin5, name=name)
+
+  job_BotBottin6 = regexp_match(regexp_BotBottin6, text)
+    
+  if job_BotBottin6:
+    return Person(birth=None, death=None, job=job_BotBottin6, name=name)
 
   # Return None is there is no sign that the page represents a person.
   return None
