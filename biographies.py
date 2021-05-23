@@ -9,7 +9,7 @@ import sys
 import reader
 
 
-# Regexps
+# Regexps biographies
 
 regexp_birth = re.compile(r"^\*\s*(\d+)[-\d\.]*\s*\/.*?Naissance.+$", re.MULTILINE)
 regexp_death = re.compile(r"^\*\s*(\d+)[-\d\.]*\s*\/.*?Décès.+$", re.MULTILINE)
@@ -18,6 +18,12 @@ regexp_election = re.compile(r"^\*.*[EÉ]lection.*?(?:en tant que|comme|au poste
 regexp_nomination = re.compile(r"^\*.*Nomination.*?(?:comme|au titre de) ?((?:(?! par)[\w '-])+).*$", re.MULTILINE)
 
 regexp_wikidata = re.compile(r"^Wikidata: (Q\d+).*$", re.MULTILINE)
+
+# Regexps bottin
+
+regexp_BotBottin2_3_4 = re.compile(r"^\*.*Mention de.*?(?:dans|avec) la catégorie ([\w '.-]+) (?:à l'adresse|\[).*$", re.MULTILINE)
+regexp_BotBottin1_5 = re.compile(r"^\*.* est mentionné dans la catégorie ([\w '.-]+)\..*$", re.MULTILINE)
+regexp_BotBottin6 = re.compile(r"^\*.*, ([\w '-]+), exerce son activité au .*$", re.MULTILINE)
 
 # Utility for getting matching groups directly.
 def regexp_match(regexp, text):
@@ -73,7 +79,7 @@ async def find_page(name, *, session, wikidata_cache):
   birth = regexp_match(regexp_birth, text)
   death = regexp_match(regexp_death, text)
 
-  jobs = re.findall(regexp_nomination, text)
+  jobs = list()
   wikidata_id = regexp_match(regexp_wikidata, text)
 
   if wikidata_id:
@@ -82,6 +88,13 @@ async def find_page(name, *, session, wikidata_cache):
 
     description = wikidata_cache[wikidata_id]
     if description: jobs.append(description)
+
+  if len(jobs) < 1:
+    for regexp in [regexp_election, regexp_nomination]:
+      jobs += re.findall(regexp, text)
+
+    for regexp in [regexp_BotBottin2_3_4, regexp_BotBottin1_5, regexp_BotBottin6]:
+      jobs += [job + " à Paris" for job in re.findall(regexp, text)]
 
   if birth or death or jobs:
     return Person(birth=birth, death=death, job=jobs[-1] if jobs else None, name=name)
