@@ -1,12 +1,12 @@
 import aiohttp
+import argparse
 import asyncio
 from collections import namedtuple
 import numpy as np
-import pywikiapi
 import re
-import sys
 
 import reader
+from writer import Writer
 
 
 # Regexps biographies
@@ -33,21 +33,12 @@ def regexp_match(regexp, text):
     return match.groups()[0]
 
 
-# Wikipast
-
-site_wikipast = pywikiapi.Site("http://wikipast.epfl.ch/wikipast/api.php")
-site_wikipast.no_ssl = True
-
-def edit_page(title, text):
-  site_wikipast('edit', title=title, text=text, token=site_wikipast.token())
-
-
 # Wikidata
 
 async def get_wikidata_description(wikidata_id, *, session):
   async with session.get(f"https://www.wikidata.org/w/api.php?action=wbgetentities&ids={wikidata_id}&format=json&formatversion=2") as resp:
     if resp.status == 429:
-      print(f"Warning: Wikidata returned HTTP 429", file=sys.stderr)
+      print(f"Warning: Wikidata returned HTTP 429")
       return None
 
     data = await resp.json()
@@ -64,7 +55,8 @@ async def get_wikidata_description(wikidata_id, *, session):
 
   return None
 
-# ---
+
+# Fetching
 
 Person = namedtuple("Person", ["birth", "death", "job", "name"])
 
@@ -105,12 +97,10 @@ async def find_page(name, *, session, wikidata_cache):
 
 # Storage
 
-Homonyms = namedtuple("Homonyms", ["name", "people"])
-homonyms_names = np.load("name_homonomys.npy", allow_pickle=True)[0:1000]
-disambiguation_names = np.load("disambiguation_names.npy", allow_pickle=True)
+Homonyms = namedtuple("Homonyms", ["name", "people", "title"])
 
 
-async def create_list():
+async def create_list(homonyms_names, disambiguation_names):
   # Limit to 30 parallel connections to avoid HTTP 429 "Too many requests" responses from Wikidata.
   session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=30))
   homonyms_list = list()
@@ -130,10 +120,11 @@ async def create_list():
       if page: people.append(page)
 
     if len(people) > 1:
-      homonyms_list.append(Homonyms(name=disambiguation_names[index].title(), people=people))
+      name = disambiguation_names[index]
+      homonyms_list.append(Homonyms(name=name, people=people, title=(name + " (disambiguation)")))
 
     done += 1
-    print(f"\r{done}/{len(homonyms_names)}", end="", file=sys.stderr)
+    print(f"\r{done}/{len(homonyms_names)}", end="")
 
 
   await asyncio.gather(*[process_homonyms(index) for index in range(len(homonyms_names))])
@@ -146,7 +137,7 @@ async def create_list():
 
 def format_homonyms(homonyms):
   output = str()
-  output += f"[[{homonyms.name} (disambiguation)|{homonyms.name}]] peut désigner :\n"
+  output += f"[[{homonyms.title}|{homonyms.name}]] peut désigner :\n"
 
   for person in homonyms.people:
     output += f"* [[{person.name}]]"
@@ -162,13 +153,62 @@ def format_homonyms(homonyms):
   return output
 
 
+# Writing
+
+async def write_list(homonyms_list, *, writer):
+  done = 0
+
+  async def iterate(homonyms):
+    nonlocal done
+
+    await writer.write(homonyms.title, format_homonyms(homonyms))
+
+    done += 1
+    print(f"\r{done}/{len(homonyms_list)}", end="")
+
+  try:
+    await writer.open()
+    await asyncio.gather(*[iterate(homonyms) for homonyms in homonyms_list])
+
+  finally:
+    await writer.close()
+
+
 # Main
 
 async def main():
-  homonyms_list = await create_list()
+  parser = argparse.ArgumentParser()
 
-  for homonyms in homonyms_list:
-    print(format_homonyms(homonyms))
+  parser.add_argument("--username")
+  parser.add_argument("--password")
+  parser.add_argument("--overwrite", action="store_true")
+  parser.add_argument("--range", default=":")
+
+  args = parser.parse_args()
+  range_slice = slice(*[int(index) if len(index) > 0 else None for index in args.range.split(":")])
+
+  disambiguation_names = np.load("disambiguation_names.npy", allow_pickle=True)
+  homonyms_names = np.load("name_homonomys.npy", allow_pickle=True)
+  homonyms_names_sliced = homonyms_names[range_slice]
+
+  print(f"Fetching homonyms for {len(homonyms_names_sliced)} of {len(homonyms_names)} groups")
+
+  homonyms_list = await create_list(homonyms_names_sliced, disambiguation_names[range_slice])
+
+  print(f"\rFound {len(homonyms_list)} groups")
+
+  if args.username and args.password:
+    writer = Writer(username=args.username, password=args.password, overwrite=args.overwrite)
+    await write_list(homonyms_list, writer=writer)
+
+    print("\rDone creating pages")
+  else:
+    print()
+
+    for homonyms in homonyms_list:
+      print(format_homonyms(homonyms))
+
+    print("\rDone formatting pages")
 
 
 loop = asyncio.get_event_loop()
